@@ -24,6 +24,15 @@ args['kernelLen'] = 32
 args['bidirectional'] = True
 args['l2_decay'] = 1e-5
 
+# added
+args['use_layernorm'] = True
+args['patience'] = True
+args['patience_limit'] = 50
+args['model'] = 'LSTM' # GRU, LSTM
+args['use_gradClip'] = False
+args['gradClip'] = 5
+args['use_AdamW'] = True
+
 from neural_decoder.neural_decoder_trainer import trainModel
 
 trainModel(args)
