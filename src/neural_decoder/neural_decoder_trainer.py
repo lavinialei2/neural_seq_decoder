@@ -6,8 +6,10 @@ from edit_distance import SequenceMatcher
 import hydra
 import numpy as np
 import torch
+from torch.nn.utils import clip_grad_norm_
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 from .model import GRUDecoder
 from .dataset import SpeechDataset
@@ -55,11 +57,42 @@ def getDatasetLoaders(
 
     return train_loader, test_loader, loadedData
 
+def _apply_time_mask(batch, mask_count, max_length):
+    if mask_count <= 0 or max_length <= 0:
+        return batch
+
+    batch_size, time_steps, _ = batch.shape
+    if time_steps == 0:
+        return batch
+
+    for b in range(batch_size):
+        for _ in range(mask_count):
+            mask_len = int(
+                torch.randint(1, max_length + 1, (1,), device=batch.device).item()
+            )
+            mask_len = min(mask_len, time_steps)
+            if mask_len <= 0:
+                continue
+            max_start = max(1, time_steps - mask_len + 1)
+            start = int(
+                torch.randint(0, max_start, (1,), device=batch.device).item()
+            )
+            end = min(time_steps, start + mask_len)
+            batch[b, start:end, :] = 0
+    return batch
+
 def trainModel(args):
     os.makedirs(args["outputDir"], exist_ok=True)
     torch.manual_seed(args["seed"])
     np.random.seed(args["seed"])
-    device = "cuda"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    label_smoothing = args.get("label_smoothing", 0.0)
+    grad_clip = args.get("grad_clip", 0.0)
+    warmup_steps = args.get("warmup_steps", 0)
+    eval_every = args.get("eval_every", 100)
+    time_mask_count = args.get("time_mask_count", 0)
+    time_mask_max_length = args.get("time_mask_max_length", 0)
+    patience = args.get("early_stopping_patience", None)
 
     with open(args["outputDir"] + "/args", "wb") as file:
         pickle.dump(args, file)
@@ -91,126 +124,170 @@ def trainModel(args):
         eps=0.1,
         weight_decay=args["l2_decay"],
     )
-    scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=1.0,
-        end_factor=args["lrEnd"] / args["lrStart"],
-        total_iters=args["nBatch"],
-    )
+    end_factor = args["lrEnd"] / args["lrStart"]
+
+    def lr_schedule(step_idx):
+        if warmup_steps > 0 and step_idx < warmup_steps:
+            return max(1e-8, float(step_idx + 1) / float(warmup_steps))
+        decay_steps = max(1, args["nBatch"] - max(warmup_steps, 1))
+        progress = max(0.0, float(step_idx - warmup_steps)) / decay_steps
+        return max(end_factor, 1.0 - progress * (1.0 - end_factor))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_schedule)
 
     # --train--
     testLoss = []
     testCER = []
     startTime = time.time()
-    for batch in range(args["nBatch"]):
-        model.train()
+    writer = SummaryWriter(log_dir=os.path.join(args["outputDir"], "tensorboard"))
+    global_step = 0
+    best_cer = float("inf")
+    batches_since_improvement = 0
+    train_iter = iter(trainLoader)
 
-        X, y, X_len, y_len, dayIdx = next(iter(trainLoader))
-        X, y, X_len, y_len, dayIdx = (
-            X.to(device),
-            y.to(device),
-            X_len.to(device),
-            y_len.to(device),
-            dayIdx.to(device),
-        )
-
-        # Noise augmentation is faster on GPU
-        if args["whiteNoiseSD"] > 0:
-            X += torch.randn(X.shape, device=device) * args["whiteNoiseSD"]
-
-        if args["constantOffsetSD"] > 0:
-            X += (
-                torch.randn([X.shape[0], 1, X.shape[2]], device=device)
-                * args["constantOffsetSD"]
+    try:
+        for batch in range(args["nBatch"]):
+            model.train()
+            try:
+                X, y, X_len, y_len, dayIdx = next(train_iter)
+            except StopIteration:
+                train_iter = iter(trainLoader)
+                X, y, X_len, y_len, dayIdx = next(train_iter)
+            X, y, X_len, y_len, dayIdx = (
+                X.to(device),
+                y.to(device),
+                X_len.to(device),
+                y_len.to(device),
+                dayIdx.to(device),
             )
 
-        # Compute prediction error
-        pred = model.forward(X, dayIdx)
+            # Noise augmentation is faster on GPU
+            if args["whiteNoiseSD"] > 0:
+                X += torch.randn(X.shape, device=device) * args["whiteNoiseSD"]
 
-        loss = loss_ctc(
-            torch.permute(pred.log_softmax(2), [1, 0, 2]),
-            y,
-            ((X_len - model.kernelLen) / model.strideLen).to(torch.int32),
-            y_len,
-        )
-        loss = torch.sum(loss)
-
-        # Backpropagation
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-
-        # print(endTime - startTime)
-
-        # Eval
-        if batch % 100 == 0:
-            with torch.no_grad():
-                model.eval()
-                allLoss = []
-                total_edit_distance = 0
-                total_seq_length = 0
-                for X, y, X_len, y_len, testDayIdx in testLoader:
-                    X, y, X_len, y_len, testDayIdx = (
-                        X.to(device),
-                        y.to(device),
-                        X_len.to(device),
-                        y_len.to(device),
-                        testDayIdx.to(device),
-                    )
-
-                    pred = model.forward(X, testDayIdx)
-                    loss = loss_ctc(
-                        torch.permute(pred.log_softmax(2), [1, 0, 2]),
-                        y,
-                        ((X_len - model.kernelLen) / model.strideLen).to(torch.int32),
-                        y_len,
-                    )
-                    loss = torch.sum(loss)
-                    allLoss.append(loss.cpu().detach().numpy())
-
-                    adjustedLens = ((X_len - model.kernelLen) / model.strideLen).to(
-                        torch.int32
-                    )
-                    for iterIdx in range(pred.shape[0]):
-                        decodedSeq = torch.argmax(
-                            torch.tensor(pred[iterIdx, 0 : adjustedLens[iterIdx], :]),
-                            dim=-1,
-                        )  # [num_seq,]
-                        decodedSeq = torch.unique_consecutive(decodedSeq, dim=-1)
-                        decodedSeq = decodedSeq.cpu().detach().numpy()
-                        decodedSeq = np.array([i for i in decodedSeq if i != 0])
-
-                        trueSeq = np.array(
-                            y[iterIdx][0 : y_len[iterIdx]].cpu().detach()
-                        )
-
-                        matcher = SequenceMatcher(
-                            a=trueSeq.tolist(), b=decodedSeq.tolist()
-                        )
-                        total_edit_distance += matcher.distance()
-                        total_seq_length += len(trueSeq)
-
-                avgDayLoss = np.sum(allLoss) / len(testLoader)
-                cer = total_edit_distance / total_seq_length
-
-                endTime = time.time()
-                print(
-                    f"batch {batch}, ctc loss: {avgDayLoss:>7f}, cer: {cer:>7f}, time/batch: {(endTime - startTime)/100:>7.3f}"
+            if args["constantOffsetSD"] > 0:
+                X += (
+                    torch.randn([X.shape[0], 1, X.shape[2]], device=device)
+                    * args["constantOffsetSD"]
                 )
-                startTime = time.time()
 
-            if len(testCER) > 0 and cer < np.min(testCER):
-                torch.save(model.state_dict(), args["outputDir"] + "/modelWeights")
-            testLoss.append(avgDayLoss)
-            testCER.append(cer)
+            if time_mask_count > 0 and time_mask_max_length > 0:
+                X = _apply_time_mask(X, time_mask_count, time_mask_max_length)
 
-            tStats = {}
-            tStats["testLoss"] = np.array(testLoss)
-            tStats["testCER"] = np.array(testCER)
+            # Compute prediction error
+            pred = model.forward(X, dayIdx)
+            log_probs = pred.log_softmax(2)
+            input_lengths = ((X_len - model.kernelLen) / model.strideLen).to(torch.int32)
 
-            with open(args["outputDir"] + "/trainingStats", "wb") as file:
-                pickle.dump(tStats, file)
+            ctc_loss = loss_ctc(
+                torch.permute(log_probs, [1, 0, 2]),
+                y,
+                input_lengths,
+                y_len,
+            )
+            if label_smoothing > 0:
+                smoothing_loss = -log_probs.mean()
+                loss = (1 - label_smoothing) * ctc_loss + label_smoothing * smoothing_loss
+            else:
+                loss = ctc_loss
+
+            # Backpropagation
+            optimizer.zero_grad()
+            loss.backward()
+            if grad_clip and grad_clip > 0:
+                clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            scheduler.step()
+
+            global_step += 1
+            writer.add_scalar("train/ctc_loss", ctc_loss.item(), global_step)
+            writer.add_scalar("train/loss", loss.item(), global_step)
+            writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
+
+            # Eval
+            if batch % eval_every == 0:
+                with torch.no_grad():
+                    model.eval()
+                    allLoss = []
+                    total_edit_distance = 0
+                    total_seq_length = 0
+                    for X, y, X_len, y_len, testDayIdx in testLoader:
+                        X, y, X_len, y_len, testDayIdx = (
+                            X.to(device),
+                            y.to(device),
+                            X_len.to(device),
+                            y_len.to(device),
+                            testDayIdx.to(device),
+                        )
+
+                        pred = model.forward(X, testDayIdx)
+                        eval_lengths = (
+                            (X_len - model.kernelLen) / model.strideLen
+                        ).to(torch.int32)
+                        eval_loss = loss_ctc(
+                            torch.permute(pred.log_softmax(2), [1, 0, 2]),
+                            y,
+                            eval_lengths,
+                            y_len,
+                        )
+                        allLoss.append(eval_loss.cpu().detach().numpy())
+
+                        for iterIdx in range(pred.shape[0]):
+                            decodedSeq = torch.argmax(
+                                torch.tensor(
+                                    pred[iterIdx, 0 : eval_lengths[iterIdx], :]
+                                ),
+                                dim=-1,
+                            )  # [num_seq,]
+                            decodedSeq = torch.unique_consecutive(decodedSeq, dim=-1)
+                            decodedSeq = decodedSeq.cpu().detach().numpy()
+                            decodedSeq = np.array([i for i in decodedSeq if i != 0])
+
+                            trueSeq = np.array(
+                                y[iterIdx][0 : y_len[iterIdx]].cpu().detach()
+                            )
+
+                            matcher = SequenceMatcher(
+                                a=trueSeq.tolist(), b=decodedSeq.tolist()
+                            )
+                            total_edit_distance += matcher.distance()
+                            total_seq_length += len(trueSeq)
+
+                    avgDayLoss = np.sum(allLoss) / len(testLoader)
+                    cer = total_edit_distance / total_seq_length
+
+                    endTime = time.time()
+                    print(
+                        f"batch {batch}, ctc loss: {avgDayLoss:>7f}, cer: {cer:>7f}, time/batch: {(endTime - startTime)/max(1, eval_every):>7.3f}"
+                    )
+                    writer.add_scalar("eval/ctc_loss", avgDayLoss, global_step)
+                    writer.add_scalar("eval/cer", cer, global_step)
+                    startTime = time.time()
+
+                if cer < best_cer:
+                    torch.save(model.state_dict(), args["outputDir"] + "/modelWeights")
+                    best_cer = cer
+                    batches_since_improvement = 0
+                else:
+                    batches_since_improvement += 1
+
+                testLoss.append(avgDayLoss)
+                testCER.append(cer)
+
+                tStats = {}
+                tStats["testLoss"] = np.array(testLoss)
+                tStats["testCER"] = np.array(testCER)
+
+                with open(args["outputDir"] + "/trainingStats", "wb") as file:
+                    pickle.dump(tStats, file)
+
+                if patience is not None and batches_since_improvement >= patience:
+                    print(
+                        f"Early stopping triggered at batch {batch} with best CER {best_cer:.4f}"
+                    )
+                    break
+    finally:
+        writer.close()
 
 
 def loadModel(modelDir, nInputLayers=24, device="cuda"):

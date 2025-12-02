@@ -80,6 +80,9 @@ class GRUDecoder(nn.Module):
         else:
             self.fc_decoder_out = nn.Linear(hidden_dim, n_classes + 1)  # +1 for CTC blank
 
+        norm_dim = hidden_dim * 2 if self.bidirectional else hidden_dim
+        self.layer_norm = nn.LayerNorm(norm_dim)
+
     def forward(self, neuralInput, dayIdx):
         neuralInput = torch.permute(neuralInput, (0, 2, 1))
         neuralInput = self.gaussianSmoother(neuralInput)
@@ -117,6 +120,7 @@ class GRUDecoder(nn.Module):
             ).requires_grad_()
 
         hid, _ = self.gru_decoder(stridedInputs, h0.detach())
+        hid = self.layer_norm(hid)
 
         # get seq
         seq_out = self.fc_decoder_out(hid)

@@ -1,13 +1,13 @@
-modelName = 'speechBaseline4'
+modelName = 'speechBaseline_enhanced_batchsize32'
 
 args = {}
 args['outputDir'] = '/home/lavinialei/neural_seq_decoder/baseline_logs/' + modelName
 args['datasetPath'] = '/home/lavinialei/neural_seq_decoder/ptDecoder_ctc'
 args['seqLen'] = 150
 args['maxTimeSeriesLen'] = 1200
-args['batchSize'] = 128
-args['lrStart'] = 0.05
-args['lrEnd'] = 0.02
+args['batchSize'] = 32
+args['lrStart'] = 0.02
+args['lrEnd'] = 0.002
 args['nUnits'] = 256
 args['nBatch'] = 10000 #3000
 args['nLayers'] = 5
@@ -22,6 +22,13 @@ args['strideLen'] = 4
 args['kernelLen'] = 32
 args['bidirectional'] = False
 args['l2_decay'] = 1e-5
+args['label_smoothing'] = 0.1
+args['grad_clip'] = 5.0
+args['warmup_steps'] = 500
+args['time_mask_count'] = 2
+args['time_mask_max_length'] = 20
+args['eval_every'] = 100
+args['early_stopping_patience'] = 50
 
 from neural_decoder.neural_decoder_trainer import trainModel
 
