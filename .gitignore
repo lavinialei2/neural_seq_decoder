@@ -1,3 +1,8 @@
+# Dataset
+competitionData/
+competitionData.tar.gz
+ptDecoder_ctc
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
