@@ -9,8 +9,10 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 
-from .model import GRUDecoder
+from .model import GRUDecoder, LSTMDecoder
 from .dataset import SpeechDataset
+
+from torch.utils.tensorboard import SummaryWriter
 
 
 def getDatasetLoaders(
@@ -57,6 +59,10 @@ def getDatasetLoaders(
 
 def trainModel(args):
     os.makedirs(args["outputDir"], exist_ok=True)
+
+    writer = SummaryWriter(log_dir=args['outputDir'] + "/tensorboard")
+    print("Writer created:", writer)
+
     torch.manual_seed(args["seed"])
     np.random.seed(args["seed"])
     device = "cuda"
@@ -69,28 +75,55 @@ def trainModel(args):
         args["batchSize"],
     )
 
-    model = GRUDecoder(
-        neural_dim=args["nInputFeatures"],
-        n_classes=args["nClasses"],
-        hidden_dim=args["nUnits"],
-        layer_dim=args["nLayers"],
-        nDays=len(loadedData["train"]),
-        dropout=args["dropout"],
-        device=device,
-        strideLen=args["strideLen"],
-        kernelLen=args["kernelLen"],
-        gaussianSmoothWidth=args["gaussianSmoothWidth"],
-        bidirectional=args["bidirectional"],
-    ).to(device)
+    if args['model'] == 'GRU':
+        model = GRUDecoder(
+            neural_dim=args["nInputFeatures"],
+            n_classes=args["nClasses"],
+            hidden_dim=args["nUnits"],
+            layer_dim=args["nLayers"],
+            nDays=len(loadedData["train"]),
+            dropout=args["dropout"],
+            device=device,
+            strideLen=args["strideLen"],
+            kernelLen=args["kernelLen"],
+            gaussianSmoothWidth=args["gaussianSmoothWidth"],
+            bidirectional=args["bidirectional"],
+            use_layernorm = args['use_layernorm'],
+        ).to(device)
+    if args['model'] == 'LSTM':
+        model = LSTMDecoder(
+            neural_dim=args["nInputFeatures"],
+            n_classes=args["nClasses"],
+            hidden_dim=args["nUnits"],
+            layer_dim=args["nLayers"],
+            nDays=len(loadedData["train"]),
+            dropout=args["dropout"],
+            device=device,
+            strideLen=args["strideLen"],
+            kernelLen=args["kernelLen"],
+            gaussianSmoothWidth=args["gaussianSmoothWidth"],
+            bidirectional=args["bidirectional"],
+            use_layernorm = args['use_layernorm'],
+        ).to(device)
 
     loss_ctc = torch.nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=args["lrStart"],
-        betas=(0.9, 0.999),
-        eps=0.1,
-        weight_decay=args["l2_decay"],
-    )
+
+    if args['use_AdamW']:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=args["lrStart"],
+            betas=(0.9, 0.999),
+            eps=0.1,
+            weight_decay=args["l2_decay"],
+        )
+    else:
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=args["lrStart"],
+            betas=(0.9, 0.999),
+            eps=0.1,
+            weight_decay=args["l2_decay"],
+        )
     scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
         start_factor=1.0,
@@ -99,6 +132,11 @@ def trainModel(args):
     )
 
     # --train--
+    
+    # Early Stopping
+    patience_counter = 0
+    best_cer = float('inf')
+
     testLoss = []
     testCER = []
     startTime = time.time()
@@ -138,8 +176,18 @@ def trainModel(args):
         # Backpropagation
         optimizer.zero_grad()
         loss.backward()
+
+        # Gradient Clipping
+        if args['use_gradClip']:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args['gradClip'])
+
         optimizer.step()
         scheduler.step()
+
+        train_loss = loss.item()
+        current_lr = scheduler.get_last_lr()[0]
+        writer.add_scalar('Loss/train', train_loss, batch)
+        writer.add_scalar('Metrics/learning_rate', current_lr, batch)
 
         # print(endTime - startTime)
 
@@ -194,14 +242,34 @@ def trainModel(args):
                 avgDayLoss = np.sum(allLoss) / len(testLoader)
                 cer = total_edit_distance / total_seq_length
 
+                test_loss = avgDayLoss
+                writer.add_scalar('Loss/test', test_loss, batch)
+                writer.add_scalar('Metrics/CER', cer, batch)
+
+                # Early Stopping
+                if args['patience']:
+                    if cer < best_cer:
+                        print(f'\nNew best CER: {cer:>7f} (Previous {best_cer:>7f})')
+                        best_cer = cer
+                        torch.save(model.state_dict(), args["outputDir"] + "/modelWeights")
+                        patience_counter = 0
+                    else:
+                        patience_counter += 1
+                    if patience_counter >= args['patience_limit']:
+                        print('\nEarly stopping!')
+                        break
+
                 endTime = time.time()
                 print(
                     f"batch {batch}, ctc loss: {avgDayLoss:>7f}, cer: {cer:>7f}, time/batch: {(endTime - startTime)/100:>7.3f}"
                 )
                 startTime = time.time()
 
-            if len(testCER) > 0 and cer < np.min(testCER):
-                torch.save(model.state_dict(), args["outputDir"] + "/modelWeights")
+            # Early Stopping
+            if not args['patience']:
+                if len(testCER) > 0 and cer < np.min(testCER):
+                    torch.save(model.state_dict(), args["outputDir"] + "/modelWeights")
+
             testLoss.append(avgDayLoss)
             testCER.append(cer)
 
