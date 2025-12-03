@@ -81,6 +81,21 @@ def _apply_time_mask(batch, mask_count, max_length):
             batch[b, start:end, :] = 0
     return batch
 
+def _apply_feature_mask(batch, mask_count, mask_size):
+    if mask_count <= 0 or mask_size <= 0:
+        return batch
+    batch_size, time_steps, feat_dim = batch.shape
+    if feat_dim == 0:
+        return batch
+    for b in range(batch_size):
+        for _ in range(mask_count):
+            size = min(int(mask_size), feat_dim)
+            if size <= 0:
+                continue
+            start = int(torch.randint(0, max(1, feat_dim - size + 1), (1,), device=batch.device).item())
+            batch[b, :, start : start + size] = 0
+    return batch
+
 def trainModel(args):
     os.makedirs(args["outputDir"], exist_ok=True)
     torch.manual_seed(args["seed"])
@@ -93,6 +108,11 @@ def trainModel(args):
     time_mask_count = args.get("time_mask_count", 0)
     time_mask_max_length = args.get("time_mask_max_length", 0)
     patience = args.get("early_stopping_patience", None)
+    early_stopping_start = args.get("early_stopping_start", args["nBatch"])
+    optimizer_name = args.get("optimizer", "adam").lower()
+    adam_epsilon = args.get("adam_epsilon", 1e-8)
+    feature_mask_count = args.get("feature_mask_count", 0)
+    feature_mask_size = args.get("feature_mask_size", 0)
 
     with open(args["outputDir"] + "/args", "wb") as file:
         pickle.dump(args, file)
@@ -114,16 +134,29 @@ def trainModel(args):
         kernelLen=args["kernelLen"],
         gaussianSmoothWidth=args["gaussianSmoothWidth"],
         bidirectional=args["bidirectional"],
+        rnn_type=args.get("rnn_type", "gru"),
+        post_ffn_layers=args.get("post_ffn_layers", 0),
+        post_ffn_hidden=args.get("post_ffn_hidden", None),
+        post_ffn_dropout=args.get("post_ffn_dropout", 0.0),
     ).to(device)
 
     loss_ctc = torch.nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=args["lrStart"],
-        betas=(0.9, 0.999),
-        eps=0.1,
-        weight_decay=args["l2_decay"],
-    )
+    if optimizer_name == "adamw":
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=args["lrStart"],
+            betas=(0.9, 0.999),
+            eps=adam_epsilon,
+            weight_decay=args["l2_decay"],
+        )
+    else:
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=args["lrStart"],
+            betas=(0.9, 0.999),
+            eps=adam_epsilon,
+            weight_decay=args["l2_decay"],
+        )
     end_factor = args["lrEnd"] / args["lrStart"]
 
     def lr_schedule(step_idx):
@@ -171,13 +204,18 @@ def trainModel(args):
                     * args["constantOffsetSD"]
                 )
 
+            if feature_mask_count > 0 and feature_mask_size > 0:
+                X = _apply_feature_mask(X, feature_mask_count, feature_mask_size)
             if time_mask_count > 0 and time_mask_max_length > 0:
                 X = _apply_time_mask(X, time_mask_count, time_mask_max_length)
 
             # Compute prediction error
             pred = model.forward(X, dayIdx)
             log_probs = pred.log_softmax(2)
-            input_lengths = ((X_len - model.kernelLen) / model.strideLen).to(torch.int32)
+            input_lengths = torch.clamp(
+                torch.floor((X_len - model.kernelLen) / model.strideLen).to(torch.int32),
+                min=1,
+            )
 
             ctc_loss = loss_ctc(
                 torch.permute(log_probs, [1, 0, 2]),
@@ -190,6 +228,11 @@ def trainModel(args):
                 loss = (1 - label_smoothing) * ctc_loss + label_smoothing * smoothing_loss
             else:
                 loss = ctc_loss
+
+            if not torch.isfinite(loss):
+                print(f"Skipping batch {batch} due to non-finite loss")
+                optimizer.zero_grad()
+                continue
 
             # Backpropagation
             optimizer.zero_grad()
@@ -221,9 +264,12 @@ def trainModel(args):
                         )
 
                         pred = model.forward(X, testDayIdx)
-                        eval_lengths = (
-                            (X_len - model.kernelLen) / model.strideLen
-                        ).to(torch.int32)
+                        eval_lengths = torch.clamp(
+                            torch.floor((X_len - model.kernelLen) / model.strideLen).to(
+                                torch.int32
+                            ),
+                            min=1,
+                        )
                         eval_loss = loss_ctc(
                             torch.permute(pred.log_softmax(2), [1, 0, 2]),
                             y,
@@ -281,7 +327,11 @@ def trainModel(args):
                 with open(args["outputDir"] + "/trainingStats", "wb") as file:
                     pickle.dump(tStats, file)
 
-                if patience is not None and batches_since_improvement >= patience:
+                if (
+                    patience is not None
+                    and batch >= early_stopping_start
+                    and batches_since_improvement >= patience
+                ):
                     print(
                         f"Early stopping triggered at batch {batch} with best CER {best_cer:.4f}"
                     )
@@ -307,6 +357,7 @@ def loadModel(modelDir, nInputLayers=24, device="cuda"):
         kernelLen=args["kernelLen"],
         gaussianSmoothWidth=args["gaussianSmoothWidth"],
         bidirectional=args["bidirectional"],
+        rnn_type=args.get("rnn_type", "gru"),
     ).to(device)
 
     model.load_state_dict(torch.load(modelWeightPath, map_location=device))
