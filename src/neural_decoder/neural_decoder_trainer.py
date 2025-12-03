@@ -88,7 +88,7 @@ def trainModel(args):
         model.parameters(),
         lr=args["lrStart"],
         betas=(0.9, 0.999),
-        eps=0.1,
+        eps=0.0001,
         weight_decay=args["l2_decay"],
     )
     scheduler = torch.optim.lr_scheduler.LinearLR(

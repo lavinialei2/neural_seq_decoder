@@ -1,13 +1,13 @@
-modelName = 'speechBaseline4'
+modelName = 'speechBaseline4_hyperparamtuning'
 
 args = {}
 args['outputDir'] = '/home/lavinialei/neural_seq_decoder/baseline_logs/' + modelName
 args['datasetPath'] = '/home/lavinialei/neural_seq_decoder/ptDecoder_ctc'
 args['seqLen'] = 150
 args['maxTimeSeriesLen'] = 1200
-args['batchSize'] = 128
-args['lrStart'] = 0.05
-args['lrEnd'] = 0.02
+args['batchSize'] = 32
+args['lrStart'] = 0.02
+args['lrEnd'] = 0.002
 args['nUnits'] = 256
 args['nBatch'] = 10000 #3000
 args['nLayers'] = 5
