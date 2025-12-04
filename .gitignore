@@ -2,6 +2,7 @@
 competitionData/
 competitionData.tar.gz
 ptDecoder_ctc
+baseline_logs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
