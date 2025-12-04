@@ -14,6 +14,7 @@ from .dataset import SpeechDataset
 
 from torch.utils.tensorboard import SummaryWriter
 
+print("Original")
 
 def getDatasetLoaders(
     datasetName,
@@ -113,7 +114,7 @@ def trainModel(args):
             model.parameters(),
             lr=args["lrStart"],
             betas=(0.9, 0.999),
-            eps=0.1,
+            eps=0.05,
             weight_decay=args["l2_decay"],
         )
     else:
@@ -121,7 +122,7 @@ def trainModel(args):
             model.parameters(),
             lr=args["lrStart"],
             betas=(0.9, 0.999),
-            eps=0.1,
+            eps=0.05,
             weight_decay=args["l2_decay"],
         )
     scheduler = torch.optim.lr_scheduler.LinearLR(
