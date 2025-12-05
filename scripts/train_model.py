@@ -10,7 +10,7 @@ args['lrStart'] = 0.02
 args['lrEnd'] = 0.02
 args['nUnits'] = 256
 args['nBatch'] = 25000 #3000
-args['nLayers'] = 3
+args['nLayers'] = 6
 args['seed'] = 0
 args['nClasses'] = 40
 args['nInputFeatures'] = 256
@@ -28,8 +28,8 @@ args['use_layernorm'] = True
 args['patience'] = True
 args['patience_limit'] = 50
 args['model'] = 'LSTM' # GRU, LSTM
-args['use_gradClip'] = False
-args['gradClip'] = 5
+args['use_gradClip'] = True
+args['gradClip'] = 10
 args['use_AdamW'] = True
 
 from neural_decoder.neural_decoder_trainer import trainModel
